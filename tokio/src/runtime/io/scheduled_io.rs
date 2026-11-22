@@ -238,6 +238,25 @@ impl ScheduledIo {
         });
     }
 
+    /// Sets readiness bits unless this `ScheduledIo` has already been shut down.
+    /// Returns `true` if readiness was updated and waiters should be woken, or
+    /// `false` if already shut down.
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    pub(super) fn try_set_readiness(&self, ready: Ready) -> bool {
+        self.readiness
+            .fetch_update(AcqRel, Acquire, |curr| {
+                if SHUTDOWN.unpack(curr) != 0 {
+                    return None;
+                }
+                const MAX_TICK: usize = TICK.max_value() + 1;
+                let tick = TICK.unpack(curr);
+                let new_tick = tick.wrapping_add(1) % MAX_TICK;
+                let next_ready = READINESS.unpack(curr) | ready.as_usize();
+                Some(TICK.pack(new_tick, next_ready))
+            })
+            .is_ok()
+    }
+
     /// Notifies all pending waiters that have registered interest in `ready`.
     ///
     /// There may be many waiters to notify. Waking the pending task **must** be

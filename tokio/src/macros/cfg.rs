@@ -780,3 +780,13 @@ macro_rules! cfg_not_schedule_latency {
         )*
     }
 }
+
+macro_rules! cfg_io_reactor {
+    ($($item:item)*) => {
+        $(
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            #[cfg_attr(docsrs, doc(cfg(all(tokio_unstable, feature = "io-reactor", unix))))]
+            $item
+        )*
+    };
+}

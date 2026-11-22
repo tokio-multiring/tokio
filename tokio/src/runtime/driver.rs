@@ -42,12 +42,25 @@ pub(crate) struct Cfg {
     pub(crate) nevents: usize,
     pub(crate) nevents_busy: Option<usize>,
     pub(crate) timer_flavor: crate::runtime::TimerFlavor,
+
+    /// External I/O reactor factory and worker count (1 for `current_thread`).
+    /// `None` selects the built-in `mio` driver.
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    pub(crate) reactor: Option<(ReactorFactory, usize)>,
+}
+
+cfg_io_reactor! {
+    /// Builds a runtime's reactor, given its number of workers.
+    pub(crate) type ReactorFactory = std::sync::Arc<
+        dyn Fn(usize) -> io::Result<std::sync::Arc<dyn crate::runtime::io::reactor::Reactor>>
+            + Send
+            + Sync,
+    >;
 }
 
 impl Driver {
     pub(crate) fn new(cfg: Cfg) -> io::Result<(Self, Handle)> {
-        let (io_stack, io_handle, signal_handle) =
-            create_io_stack(cfg.enable_io, cfg.nevents, cfg.nevents_busy)?;
+        let (io_stack, io_handle, signal_handle) = create_io_stack(&cfg)?;
 
         let clock = create_clock(cfg.enable_pause_time, cfg.start_paused);
 
@@ -102,11 +115,23 @@ impl Handle {
                 .as_ref()
                 .expect("A Tokio 1.x context was found, but IO is disabled. Call `enable_io` on the runtime builder to enable IO.")
         }
+
+        /// The external I/O reactor driving this runtime, if any.
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        pub(crate) fn reactor(
+            &self,
+        ) -> Option<&std::sync::Arc<dyn crate::runtime::io::reactor::Reactor>> {
+            self.io.reactor()
+        }
     }
 
     cfg_signal_internal_and_unix! {
         #[track_caller]
         pub(crate) fn signal(&self) -> &crate::runtime::signal::Handle {
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            if self.signal.is_none() && self.io.reactor().is_some() {
+                panic!("signal and process listening are not supported on runtimes driven by an I/O reactor");
+            }
             self.signal
                 .as_ref()
                 .expect("A Tokio 1.x context was found, but IO is disabled. Call `enable_io` on the runtime builder to enable IO.")
@@ -132,6 +157,13 @@ impl Handle {
             f(self.time.as_ref())
         }
 
+        /// Non-panicking accessor for the time driver handle, used by the
+        /// external reactor park and shutdown paths.
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        pub(crate) fn time_handle_opt(&self) -> Option<&crate::runtime::time::Handle> {
+            self.time.as_ref()
+        }
+
         pub(crate) fn clock(&self) -> &Clock {
             &self.clock
         }
@@ -151,21 +183,40 @@ cfg_io_driver! {
     #[derive(Debug)]
     pub(crate) enum IoStack {
         Enabled(ProcessDriver),
+        /// External I/O reactor (`Builder::io_reactor`): no `mio`, signal, or
+        /// process driver is constructed. Used by `current_thread` through
+        /// `TimeDriver` (which preserves paused-clock auto-advance and timer
+        /// shutdown automatically).
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        Reactor,
         Disabled(ParkThread),
     }
 
     #[derive(Debug)]
     pub(crate) enum IoHandle {
         Enabled(crate::runtime::io::Handle),
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        Reactor(crate::runtime::io::reactor::ReactorHandle),
         Disabled(UnparkThread),
     }
 
-    fn create_io_stack(enabled: bool, nevents: usize, nevents_busy: Option<usize>) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
+    fn create_io_stack(cfg: &Cfg) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
         #[cfg(loom)]
-        assert!(!enabled);
+        assert!(!cfg.enable_io);
 
-        let ret = if enabled {
-            let (io_driver, io_handle) = crate::runtime::io::Driver::new(nevents, nevents_busy)?;
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        if let Some((factory, workers)) = &cfg.reactor {
+            let reactor = factory(*workers)?;
+            let handle = crate::runtime::io::reactor::ReactorHandle::new(reactor);
+            return Ok((
+                IoStack::Reactor,
+                IoHandle::Reactor(handle),
+                SignalHandle::default(),
+            ));
+        }
+
+        let ret = if cfg.enable_io {
+            let (io_driver, io_handle) = crate::runtime::io::Driver::new(cfg.nevents, cfg.nevents_busy)?;
 
             let (signal_driver, signal_handle) = create_signal_driver(io_driver, &io_handle)?;
             let process_driver = create_process_driver(signal_driver);
@@ -184,6 +235,12 @@ cfg_io_driver! {
         pub(crate) fn park(&mut self, handle: &Handle) {
             match self {
                 IoStack::Enabled(v) => v.park(handle),
+                #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+                IoStack::Reactor => {
+                    use crate::runtime::io::reactor::{ParkMode, Timers};
+                    let reactor = handle.reactor().expect("reactor missing");
+                    reactor.park(0, ParkMode::Park(None), &Timers::new(handle));
+                }
                 IoStack::Disabled(v) => v.park(),
             }
         }
@@ -191,6 +248,16 @@ cfg_io_driver! {
         pub(crate) fn park_timeout(&mut self, handle: &Handle, duration: Duration) {
             match self {
                 IoStack::Enabled(v) => v.park_timeout(handle, duration),
+                #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+                IoStack::Reactor => {
+                    use crate::runtime::io::reactor::{ParkMode, Timers};
+                    let reactor = handle.reactor().expect("reactor missing");
+                    if duration.is_zero() {
+                        reactor.park(0, ParkMode::Poll, &Timers::none());
+                    } else {
+                        reactor.park(0, ParkMode::Park(Some(duration)), &Timers::new(handle));
+                    }
+                }
                 IoStack::Disabled(v) => v.park_timeout(duration),
             }
         }
@@ -198,6 +265,12 @@ cfg_io_driver! {
         pub(crate) fn shutdown(&mut self, handle: &Handle) {
             match self {
                 IoStack::Enabled(v) => v.shutdown(handle),
+                #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+                IoStack::Reactor => {
+                    if let Some(reactor) = handle.reactor() {
+                        reactor.shutdown();
+                    }
+                }
                 IoStack::Disabled(v) => v.shutdown(),
             }
         }
@@ -207,6 +280,8 @@ cfg_io_driver! {
         pub(crate) fn unpark(&self) {
             match self {
                 IoHandle::Enabled(handle) => handle.unpark(),
+                #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+                IoHandle::Reactor(handle) => handle.reactor().unpark(0),
                 IoHandle::Disabled(handle) => handle.unpark(),
             }
         }
@@ -214,8 +289,43 @@ cfg_io_driver! {
         pub(crate) fn as_ref(&self) -> Option<&crate::runtime::io::Handle> {
             match self {
                 IoHandle::Enabled(v) => Some(v),
+                #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+                IoHandle::Reactor(..) => None,
                 IoHandle::Disabled(..) => None,
             }
+        }
+
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        pub(crate) fn reactor(
+            &self,
+        ) -> Option<&std::sync::Arc<dyn crate::runtime::io::reactor::Reactor>> {
+            match self {
+                IoHandle::Reactor(v) => Some(v.reactor()),
+                IoHandle::Enabled(..) | IoHandle::Disabled(..) => None,
+            }
+        }
+
+        #[cfg_attr(
+            not(all(tokio_unstable, feature = "net", feature = "rt")),
+            allow(dead_code)
+        )]
+        pub(crate) fn metrics(&self) -> Option<&crate::runtime::io::IoDriverMetrics> {
+            match self {
+                IoHandle::Enabled(v) => Some(&v.metrics),
+                #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+                IoHandle::Reactor(v) => Some(v.metrics()),
+                IoHandle::Disabled(..) => None,
+            }
+        }
+    }
+
+    #[cfg(feature = "time")]
+    pub(crate) fn unpark_for_timer(io: &IoHandle) {
+        match io {
+            IoHandle::Enabled(handle) => handle.unpark(),
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            IoHandle::Reactor(handle) => handle.reactor().unpark_for_timer(),
+            IoHandle::Disabled(handle) => handle.unpark(),
         }
     }
 }
@@ -226,10 +336,15 @@ cfg_not_io_driver! {
     #[derive(Debug)]
     pub(crate) struct IoStack(ParkThread);
 
-    fn create_io_stack(_enabled: bool, _nevents: usize, _nevents_busy: Option<usize>) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
+    fn create_io_stack(_cfg: &Cfg) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
         let park_thread = ParkThread::new();
         let unpark_thread = park_thread.unpark();
         Ok((IoStack(park_thread), unpark_thread, Default::default()))
+    }
+
+    #[cfg(feature = "time")]
+    pub(crate) fn unpark_for_timer(io: &IoHandle) {
+        io.unpark();
     }
 
     impl IoStack {

@@ -79,6 +79,15 @@ impl<T: AioSource> Source for MioSource<T> {
     }
 }
 
+#[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+impl<T: AioSource> crate::runtime::io::registration::RegistrationSource for MioSource<T> {
+    fn registration_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        // Kernel AIO completion is not an fd-backed readiness source;
+        // fd-keyed external reactors cannot drive it and fail registration.
+        None
+    }
+}
+
 /// Associates a POSIX AIO control block with the reactor that drives it.
 ///
 /// `Aio`'s wrapped type must implement [`AioSource`] to be driven

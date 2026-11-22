@@ -565,6 +565,16 @@ cfg_rt! {
         pub use crate::util::rand::RngSeed;
     }
 
+    cfg_io_reactor! {
+        /// The seam for an I/O reactor that lives outside Tokio: see
+        /// [`Reactor`](reactor::Reactor) and [`Builder::io_reactor`].
+        pub mod reactor {
+            pub use crate::runtime::io::reactor::{
+                ParkMode, Reactor, Readiness, RegistrationToken, Timers,
+            };
+        }
+    }
+
     /// Returns the index of the current worker thread, if called from a
     /// runtime worker thread.
     ///

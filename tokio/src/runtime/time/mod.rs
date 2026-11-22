@@ -22,6 +22,8 @@ mod wheel;
 use super::time_alt;
 
 use crate::loom::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+use crate::loom::sync::atomic::AtomicU64;
 use crate::loom::sync::Mutex;
 use crate::runtime::driver::{self, IoHandle, IoStack};
 use crate::time::error::Error;
@@ -100,6 +102,20 @@ enum Inner {
         /// True if the driver is being shutdown.
         is_shutdown: AtomicBool,
 
+        /// Lock-free mirror of `state.next_wake`, or [`NO_TIMER`] when no timer
+        /// is pending.
+        ///
+        /// Always satisfies `next_wake_atomic <= actual earliest pending tick`
+        /// (never larger than any registered timer's deadline). Updated under
+        /// `state` whenever `next_wake` changes, with `SeqCst` on lowering
+        /// inserts so external reactors can pair it with `unpark_for_timer`
+        /// via a `SeqCst` Dekker handshake.
+        ///
+        /// The wheel cannot represent ticks beyond `1 << 36`, so `u64::MAX`
+        /// cannot alias a real deadline.
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        next_wake_atomic: AtomicU64,
+
         // When `true`, a call to `park_timeout` should immediately return and time
         // should not advance. One reason for this to be `true` is if the task
         // passed to `Runtime::block_on` called `task::yield_now()`.
@@ -126,6 +142,16 @@ struct InnerState {
     wheel: wheel::Wheel,
 }
 
+/// Sentinel for `Inner::next_wake_atomic` indicating no registered timer.
+#[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+const NO_TIMER: u64 = u64::MAX;
+
+#[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+#[inline]
+fn next_wake_to_atomic(next_wake: Option<u64>) -> u64 {
+    next_wake.unwrap_or(NO_TIMER)
+}
+
 // ===== impl Driver =====
 
 impl Driver {
@@ -144,6 +170,8 @@ impl Driver {
                     wheel: wheel::Wheel::new(),
                 }),
                 is_shutdown: AtomicBool::new(false),
+                #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+                next_wake_atomic: AtomicU64::new(NO_TIMER),
 
                 #[cfg(feature = "test-util")]
                 did_wake: AtomicBool::new(false),
@@ -176,25 +204,7 @@ impl Driver {
     }
 
     pub(crate) fn shutdown(&mut self, rt_handle: &driver::Handle) {
-        let handle = rt_handle.time();
-
-        if handle.is_shutdown() {
-            return;
-        }
-
-        match &handle.inner {
-            Inner::Traditional { is_shutdown, .. } => {
-                is_shutdown.store(true, Ordering::SeqCst);
-            }
-            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
-            Inner::Alternative { is_shutdown, .. } => {
-                is_shutdown.store(true, Ordering::SeqCst);
-            }
-        }
-
-        // Advance time forward to the end of time.
-
-        handle.process_at_time(u64::MAX);
+        rt_handle.time().shutdown();
 
         self.park.shutdown(rt_handle);
     }
@@ -208,6 +218,11 @@ impl Driver {
         let next_wake = lock.wheel.next_expiration_time();
         lock.next_wake =
             next_wake.map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        handle
+            .inner
+            .next_wake_atomic()
+            .store(next_wake_to_atomic(next_wake), Ordering::SeqCst);
 
         drop(lock);
 
@@ -276,10 +291,54 @@ impl Driver {
 }
 
 impl Handle {
+    pub(crate) fn shutdown(&self) {
+        if self.is_shutdown() {
+            return;
+        }
+
+        match &self.inner {
+            Inner::Traditional { is_shutdown, .. } => {
+                is_shutdown.store(true, Ordering::SeqCst);
+                // Advance time forward to the end of time.
+                self.process_at_time(u64::MAX);
+            }
+            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+            Inner::Alternative { is_shutdown, .. } => {
+                is_shutdown.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
     pub(self) fn process(&self, clock: &Clock) {
         let now = self.time_source().now(clock);
 
         self.process_at_time(now);
+    }
+
+    /// Advances the timer wheel after an external reactor returns from `park`,
+    /// skipping the wheel mutex entirely unless the cached earliest deadline
+    /// has been reached.
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    pub(crate) fn parker_process(&self, clock: &Clock) {
+        let next = self.inner.next_wake_atomic().load(Ordering::Acquire);
+        if next == NO_TIMER {
+            return;
+        }
+        let now = self.time_source().now(clock);
+        if now < next {
+            return;
+        }
+        self.process_at_time(now);
+    }
+
+    /// Lock-free read of the earliest pending timer tick, or `None` if no
+    /// timers are registered. Uses `SeqCst` so a reactor that publishes its
+    /// timekeeper slot with `SeqCst` before calling this cannot race with
+    /// `reregister`'s `SeqCst` store + `unpark_for_timer`.
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    pub(crate) fn next_wake_tick(&self) -> Option<u64> {
+        let next = self.inner.next_wake_atomic().load(Ordering::SeqCst);
+        (next != NO_TIMER).then_some(next)
     }
 
     pub(self) fn process_at_time(&self, mut now: u64) {
@@ -315,10 +374,13 @@ impl Handle {
             }
         }
 
-        lock.next_wake = lock
-            .wheel
-            .poll_at()
+        let next_wake_tick = lock.wheel.poll_at();
+        lock.next_wake = next_wake_tick
             .map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        self.inner
+            .next_wake_atomic()
+            .store(next_wake_to_atomic(next_wake_tick), Ordering::SeqCst);
 
         drop(lock);
 
@@ -392,7 +454,7 @@ impl Handle {
         new_tick: u64,
         entry: NonNull<TimerShared>,
     ) {
-        let waker = unsafe {
+        let (waker, should_unpark) = unsafe {
             let mut lock = self.inner.lock();
 
             // We may have raced with a firing/deregistration, so check before
@@ -405,7 +467,10 @@ impl Handle {
             let entry = entry.as_ref().handle();
 
             if self.is_shutdown() {
-                unsafe { entry.fire(Err(crate::time::error::Error::shutdown())) }
+                (
+                    unsafe { entry.fire(Err(crate::time::error::Error::shutdown())) },
+                    false,
+                )
             } else {
                 entry.set_expiration(new_tick);
 
@@ -414,23 +479,37 @@ impl Handle {
                 // the timer entry.
                 match unsafe { lock.wheel.insert(entry) } {
                     Ok(when) => {
-                        if lock
+                        let need_unpark = lock
                             .next_wake
-                            .is_none_or(|next_wake| when < next_wake.get())
-                        {
-                            unpark.unpark();
+                            .is_none_or(|next_wake| when < next_wake.get());
+                        if need_unpark {
+                            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+                            {
+                                lock.next_wake = Some(
+                                    NonZeroU64::new(when)
+                                        .unwrap_or_else(|| NonZeroU64::new(1).unwrap()),
+                                );
+                                self.inner
+                                    .next_wake_atomic()
+                                    .store(when, Ordering::SeqCst);
+                            }
                         }
 
-                        None
+                        (None, need_unpark)
                     }
-                    Err((entry, crate::time::error::InsertError::Elapsed)) => unsafe {
-                        entry.fire(Ok(()))
-                    },
+                    Err((entry, crate::time::error::InsertError::Elapsed)) => {
+                        (unsafe { entry.fire(Ok(())) }, false)
+                    }
                 }
             }
 
-            // Must release lock before invoking waker to avoid the risk of deadlock.
+            // Must release lock before invoking waker or external reactor
+            // callbacks to avoid deadlock.
         };
+
+        if should_unpark {
+            driver::unpark_for_timer(unpark);
+        }
 
         // The timer was fired synchronously as a result of the reregistration.
         // Wake the waker; this is needed because we might reset _after_ a poll,
@@ -460,6 +539,19 @@ impl Inner {
             Inner::Traditional { state, .. } => state.lock(),
             #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
             Inner::Alternative { .. } => unreachable!("unreachable in alternative timer"),
+        }
+    }
+
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    fn next_wake_atomic(&self) -> &AtomicU64 {
+        match self {
+            Inner::Traditional {
+                next_wake_atomic, ..
+            } => next_wake_atomic,
+            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+            Inner::Alternative { .. } => {
+                unreachable!("alternative timer does not use next_wake_atomic")
+            }
         }
     }
 

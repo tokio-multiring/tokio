@@ -59,7 +59,8 @@
 use crate::loom::sync::{Arc, Mutex};
 use crate::runtime;
 use crate::runtime::scheduler::multi_thread::{
-    idle, park, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, Unparker,
+    idle, park, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, WorkerParker,
+    WorkerUnparker,
 };
 use crate::runtime::scheduler::{inject::InjectQueue, Defer};
 use crate::runtime::task::OwnedTasks;
@@ -155,7 +156,7 @@ struct Core {
     ///
     /// Stored in an `Option` as the parker is added / removed to make the
     /// borrow checker happy.
-    park: Option<Parker>,
+    park: Option<WorkerParker>,
 
     /// Per-worker runtime stats
     stats: Stats,
@@ -241,7 +242,7 @@ struct Remote {
     pub(super) steal: queue::Steal<Arc<Handle>>,
 
     /// Unparks the associated worker thread
-    unpark: Unparker,
+    unpark: WorkerUnparker,
 }
 
 /// Thread-local context
@@ -269,6 +270,20 @@ type Notified = task::Notified<Arc<Handle>>;
 /// improvements.
 const MAX_LIFO_POLLS_PER_TICK: usize = 3;
 
+fn new_worker_parker(
+    _idx: usize,
+    park: &Parker,
+    _driver_handle: &driver::Handle,
+) -> WorkerParker {
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    if let Some(reactor) = _driver_handle.reactor() {
+        use crate::runtime::scheduler::multi_thread::reactor_park::ReactorParker;
+        return WorkerParker::Reactor(ReactorParker::new(_idx, std::sync::Arc::clone(reactor)));
+    }
+
+    WorkerParker::Traditional(park.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create(
     size: usize,
@@ -285,11 +300,11 @@ pub(super) fn create(
     let mut worker_metrics = Vec::with_capacity(size);
 
     // Create the local queues
-    for _ in 0..size {
+    for worker_idx in 0..size {
         let (steal, run_queue) = queue::local();
 
-        let park = park.clone();
-        let unpark = park.unpark();
+        let park = new_worker_parker(worker_idx, &park, &driver_handle);
+        let unpark = park.unparker();
         let metrics = WorkerMetrics::from_config(&config);
         let stats = Stats::new(&metrics);
 
@@ -466,6 +481,17 @@ fn maybe_move_runtime() -> Result<(bool, bool), &'static str> {
 
         let cx = maybe_cx.expect("no .is_some() == false cases above should lead here");
 
+        // Refuse `block_in_place` before moving `core` if the runtime's
+        // external I/O reactor binds per-worker state to its OS thread.
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        if let Some(reactor) = cx.worker.handle.driver.reactor() {
+            if !reactor.allow_block_in_place() {
+                return Err(
+                    "cannot call `block_in_place` on a runtime whose I/O reactor does not support it",
+                );
+            }
+        }
+
         // Since deferred tasks don't stay on `core`, make sure to wake them
         // before blocking.
         cx.defer.wake();
@@ -542,6 +568,17 @@ fn run(worker: Arc<Worker>) {
         None => return,
     };
 
+    // On a reactor runtime, announce that this thread now runs `worker`
+    // before any task executes here, and announce stop on normal exit.
+    // Unwinding through `run` aborts the process; see `RunningWorker`.
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    let _running_worker = worker.handle.driver.reactor().map(|reactor| {
+        crate::runtime::scheduler::multi_thread::reactor_park::RunningWorker::start(
+            worker.index,
+            std::sync::Arc::clone(reactor),
+        )
+    });
+
     worker.handle.shared.worker_metrics[worker.index].set_thread_id(thread::current().id());
 
     let handle = scheduler::Handle::MultiThread(worker.handle.clone());
@@ -599,6 +636,24 @@ impl Context {
                 continue;
             }
 
+            // Give an external I/O reactor a chance to flush and reap local
+            // completions before this worker reaches for siblings' queues.
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            if let Some(reactor) = self.worker.handle.driver.reactor() {
+                core = match self.run_reactor_before_steal(core, &**reactor) {
+                    ControlFlow::Continue(core) => core,
+                    ControlFlow::Break(()) => return,
+                };
+
+                if let Some(task) = core.next_local_task() {
+                    core = match self.run_task(task, core) {
+                        ControlFlow::Continue(core) => core,
+                        ControlFlow::Break(()) => return,
+                    };
+                    continue;
+                }
+            }
+
             // We consumed all work in the queues and will start searching for work.
             core.stats.end_processing_scheduled_tasks();
 
@@ -640,6 +695,22 @@ impl Context {
         core.pre_shutdown(&self.worker);
         // Signal shutdown
         self.worker.handle.shutdown_core(core);
+    }
+
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    fn run_reactor_before_steal(
+        &self,
+        core: Box<Core>,
+        reactor: &dyn crate::runtime::io::reactor::Reactor,
+    ) -> ControlFlow<(), Box<Core>> {
+        *self.core.borrow_mut() = Some(core);
+
+        reactor.before_steal(self.worker.index);
+
+        match self.core.borrow_mut().take() {
+            Some(core) => ControlFlow::Continue(core),
+            None => ControlFlow::Break(()),
+        }
     }
 
     /// Running a task may consume the core. If the core is still available when

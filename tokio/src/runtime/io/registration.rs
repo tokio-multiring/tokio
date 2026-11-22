@@ -1,13 +1,76 @@
 #![cfg_attr(not(feature = "net"), allow(dead_code))]
 
 use crate::io::interest::Interest;
-use crate::runtime::io::{Direction, Handle, ReadyEvent, ScheduledIo};
+use crate::runtime::driver::IoHandle;
+use crate::runtime::io::{Direction, ReadyEvent, ScheduledIo};
 use crate::runtime::scheduler;
 
 use crate::loom::sync::Arc;
 use mio::event::Source;
 use std::io;
 use std::task::{ready, Context, Poll};
+
+/// Source bound used by [`Registration`].
+///
+/// When `io-reactor` is enabled on Unix, sources also expose their underlying
+/// file descriptor (if fd-backed) so an external [`Reactor`] can watch them
+/// without depending on `mio`. Everywhere else this is a zero-cost alias of
+/// [`mio::event::Source`].
+///
+/// [`Reactor`]: crate::runtime::io::reactor::Reactor
+pub(crate) trait RegistrationSource: Source {
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    fn registration_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>>;
+}
+
+#[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+mod registration_source_impls {
+    use super::RegistrationSource;
+    #[cfg(feature = "net")]
+    use std::os::fd::AsFd;
+    use std::os::fd::BorrowedFd;
+
+    #[cfg(feature = "net")]
+    macro_rules! impl_registration_source_via_asfd {
+        ($($ty:ty),* $(,)?) => {$(
+            impl RegistrationSource for $ty {
+                fn registration_fd(&self) -> Option<BorrowedFd<'_>> {
+                    Some(self.as_fd())
+                }
+            }
+        )*};
+    }
+
+    #[cfg(feature = "net")]
+    impl_registration_source_via_asfd! {
+        mio::net::TcpStream,
+        mio::net::TcpListener,
+        mio::net::UdpSocket,
+        mio::net::UnixStream,
+        mio::net::UnixListener,
+        mio::net::UnixDatagram,
+        mio::unix::pipe::Sender,
+        mio::unix::pipe::Receiver,
+    }
+
+    impl RegistrationSource for mio::unix::SourceFd<'_> {
+        fn registration_fd(&self) -> Option<BorrowedFd<'_>> {
+            let raw = *self.0;
+            // Guard against `-1`, which violates `BorrowedFd`'s niche
+            // invariant (e.g. if a caller used the deprecated `AsyncFd::new`
+            // with an invalid fd).
+            if raw < 0 {
+                return None;
+            }
+            // SAFETY: `SourceFd` wraps an fd kept open by its owner across the
+            // registration call, and the returned borrow is bounded by `&self`.
+            Some(unsafe { BorrowedFd::borrow_raw(raw) })
+        }
+    }
+}
+
+#[cfg(not(all(tokio_unstable, feature = "io-reactor", unix)))]
+impl<T: Source> RegistrationSource for T {}
 
 cfg_io_driver! {
     /// Associates an I/O resource with the reactor instance that drives it.
@@ -51,6 +114,11 @@ cfg_io_driver! {
 
         /// Reference to state stored by the driver.
         shared: Arc<ScheduledIo>,
+
+        /// Opaque token minted by an external `Reactor` (unused on the `mio`
+        /// path).
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        token: crate::runtime::io::reactor::RegistrationToken,
     }
 }
 
@@ -71,13 +139,36 @@ impl Registration {
     /// - `Err` if an error was encountered during registration
     #[track_caller]
     pub(crate) fn new_with_interest_and_handle(
-        io: &mut impl Source,
+        io: &mut impl RegistrationSource,
         interest: Interest,
         handle: scheduler::Handle,
     ) -> io::Result<Registration> {
-        let shared = handle.driver().io().add_source(io, interest)?;
-
-        Ok(Registration { handle, shared })
+        match &handle.driver().io {
+            IoHandle::Enabled(driver) => {
+                let shared = driver.add_source(io, interest)?;
+                Ok(Registration {
+                    handle,
+                    shared,
+                    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+                    token: crate::runtime::io::reactor::RegistrationToken::default(),
+                })
+            }
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            IoHandle::Reactor(reactor) => {
+                let (shared, token) = reactor.register(io.registration_fd(), interest)?;
+                Ok(Registration {
+                    handle,
+                    shared,
+                    token,
+                })
+            }
+            IoHandle::Disabled(_) => {
+                panic!(
+                    "A Tokio 1.x context was found, but IO is disabled. \
+                     Call `enable_io` on the runtime builder to enable IO."
+                );
+            }
+        }
     }
 
     /// Deregisters the I/O resource from the reactor it is associated with.
@@ -96,8 +187,15 @@ impl Registration {
     /// no longer result in notifications getting sent for this registration.
     ///
     /// `Err` is returned if an error is encountered.
-    pub(crate) fn deregister(&mut self, io: &mut impl Source) -> io::Result<()> {
-        self.handle().deregister_source(&self.shared, io)
+    pub(crate) fn deregister(&mut self, io: &mut impl RegistrationSource) -> io::Result<()> {
+        match &self.handle.driver().io {
+            IoHandle::Enabled(driver) => driver.deregister_source(&self.shared, io),
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            IoHandle::Reactor(reactor) => reactor.deregister(self.token),
+            IoHandle::Disabled(_) => {
+                unreachable!("Registration cannot be created with IO disabled")
+            }
+        }
     }
 
     pub(crate) fn clear_readiness(&self, event: ReadyEvent) {
@@ -242,10 +340,6 @@ impl Registration {
                 }
             }
         }
-    }
-
-    fn handle(&self) -> &Handle {
-        self.handle.driver().io()
     }
 }
 

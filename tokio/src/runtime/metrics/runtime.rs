@@ -1299,8 +1299,8 @@ impl RuntimeMetrics {
                     .inner
                     .driver()
                     .io
-                    .as_ref()
-                    .map_or(0, |h| f(&h.metrics))
+                    .metrics()
+                    .map_or(0, f)
             }
     }
 }

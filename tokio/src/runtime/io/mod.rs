@@ -9,7 +9,7 @@ cfg_io_uring! {
     pub(crate) use driver::RegisterResult;
 }
 
-mod registration;
+pub(crate) mod registration;
 pub(crate) use registration::Registration;
 
 mod registration_set;
@@ -19,7 +19,11 @@ mod scheduled_io;
 use scheduled_io::ScheduledIo;
 
 mod metrics;
-use metrics::IoDriverMetrics;
+pub(crate) use metrics::IoDriverMetrics;
+
+cfg_io_reactor! {
+    pub(crate) mod reactor;
+}
 
 use crate::util::ptr_expose::PtrExposeDomain;
 static EXPOSE_IO: PtrExposeDomain<ScheduledIo> = PtrExposeDomain::new();

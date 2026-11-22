@@ -61,6 +61,13 @@ impl AsRawFd for Pidfd {
     }
 }
 
+#[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+impl crate::runtime::io::registration::RegistrationSource for Pidfd {
+    fn registration_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        Some(std::os::fd::AsFd::as_fd(&self.fd))
+    }
+}
+
 impl Source for Pidfd {
     fn register(
         &mut self,

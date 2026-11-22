@@ -127,6 +127,75 @@ impl Unparker {
     }
 }
 
+// ===== WorkerParker / WorkerUnparker =====
+
+#[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+use super::reactor_park::{ReactorParker, ReactorUnparker};
+
+/// Per-worker parker owned by each worker's `Core`.
+pub(crate) enum WorkerParker {
+    Traditional(Parker),
+
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    Reactor(ReactorParker),
+}
+
+/// Per-worker unparker stored in `Remote`.
+pub(crate) enum WorkerUnparker {
+    Traditional(Unparker),
+
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    Reactor(ReactorUnparker),
+}
+
+impl WorkerParker {
+    pub(crate) fn unparker(&self) -> WorkerUnparker {
+        match self {
+            WorkerParker::Traditional(p) => WorkerUnparker::Traditional(p.unpark()),
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            WorkerParker::Reactor(p) => WorkerUnparker::Reactor(p.unparker()),
+        }
+    }
+
+    pub(crate) fn park(&mut self, handle: &driver::Handle) -> HadDriver {
+        match self {
+            WorkerParker::Traditional(p) => p.park(handle),
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            WorkerParker::Reactor(p) => p.park(handle),
+        }
+    }
+
+    pub(crate) fn park_timeout(
+        &mut self,
+        handle: &driver::Handle,
+        duration: Duration,
+    ) -> HadDriver {
+        match self {
+            WorkerParker::Traditional(p) => p.park_timeout(handle, duration),
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            WorkerParker::Reactor(p) => p.park_timeout(handle, duration),
+        }
+    }
+
+    pub(crate) fn shutdown(&mut self, handle: &driver::Handle) {
+        match self {
+            WorkerParker::Traditional(p) => p.shutdown(handle),
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            WorkerParker::Reactor(p) => p.shutdown(handle),
+        }
+    }
+}
+
+impl WorkerUnparker {
+    pub(crate) fn unpark(&self, handle: &driver::Handle) {
+        match self {
+            WorkerUnparker::Traditional(u) => u.unpark(handle),
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            WorkerUnparker::Reactor(u) => u.unpark(handle),
+        }
+    }
+}
+
 impl Inner {
     /// Parks the current thread for at most `dur`.
     fn park(&self, handle: &driver::Handle) -> HadDriver {

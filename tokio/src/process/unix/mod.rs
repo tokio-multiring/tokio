@@ -37,7 +37,6 @@ use crate::process::SpawnedChild;
 use crate::runtime::signal::Handle as SignalHandle;
 use crate::signal::unix::{signal, Signal, SignalKind};
 
-use mio::event::Source;
 use mio::unix::pipe;
 use std::fmt;
 use std::fs::File;
@@ -274,7 +273,7 @@ impl TryFrom<StdChildStderr> for ChildStdout {
 
 fn convert_to_blocking_file<T>(io: PollEvented<T>) -> io::Result<File>
 where
-    T: Source + Into<OwnedFd>,
+    T: crate::runtime::io::registration::RegistrationSource + Into<OwnedFd>,
 {
     let fd: OwnedFd = io.into_inner()?.into();
     let mut fd = File::from(fd);

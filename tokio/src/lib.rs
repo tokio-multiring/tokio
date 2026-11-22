@@ -356,6 +356,7 @@
 //! - `tracing`: Enables tracing events.
 //! - `schedule-latency`: Allows measurement of task scheduling latencies.
 //! - `io-uring`: Enables `io-uring` (Linux only).
+//! - `io-reactor`: Enables plugging an external I/O reactor into the runtime (Unix only).
 //! - `taskdump`: Enables `taskdump` (Linux only).
 //!
 //! Likewise, this flag enables access to unstable APIs.

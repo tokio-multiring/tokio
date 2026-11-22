@@ -18,6 +18,16 @@ impl Handle {
         self.inner.is_shutdown()
     }
 
+    /// True if this handle uses the traditional single-mutex timer wheel.
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    pub(crate) fn is_traditional(&self) -> bool {
+        match self.inner {
+            super::Inner::Traditional { .. } => true,
+            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+            super::Inner::Alternative { .. } => false,
+        }
+    }
+
     /// Track that the driver is being unparked
     pub(crate) fn unpark(&self) {
         #[cfg(feature = "test-util")]

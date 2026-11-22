@@ -153,6 +153,10 @@ pub struct Builder {
 
     timer_flavor: TimerFlavor,
 
+    /// External I/O reactor factory set by [`Builder::io_reactor`].
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    io_reactor: Option<driver::ReactorFactory>,
+
     /// Whether or not to enable eager hand-off for the I/O and time drivers (in
     /// `tokio_unstable`).
     enable_eager_driver_handoff: bool,
@@ -369,6 +373,9 @@ impl Builder {
 
             timer_flavor: TimerFlavor::Traditional,
 
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            io_reactor: None,
+
             // Eager driver handoff is disabled by default.
             enable_eager_driver_handoff: false,
 
@@ -450,6 +457,40 @@ impl Builder {
     pub fn enable_alt_timer(&mut self) -> &mut Self {
         self.enable_time();
         self.timer_flavor = TimerFlavor::Alternative;
+        self
+    }
+
+    /// Drives the runtime with an I/O reactor from outside Tokio, in place
+    /// of Tokio's built-in `mio` driver.
+    ///
+    /// `factory` is called once per [`Builder::build`], with the number of
+    /// workers the reactor will serve: the number of worker threads of a
+    /// multi-thread runtime, or `1` for a `current_thread` runtime. Any error
+    /// it returns is propagated from [`Builder::build`].
+    ///
+    /// The reactor watches the runtime's I/O resources and parks its workers;
+    /// see [`Reactor`] for the full contract. This option implicitly enables
+    /// I/O.
+    ///
+    /// Signal and process listening are not supported on runtimes driven by an
+    /// external I/O reactor: using `tokio::signal` or `tokio::process` panics
+    /// deterministically at the point of use.
+    ///
+    /// [`Reactor`]: crate::runtime::reactor::Reactor
+    #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(tokio_unstable, feature = "io-reactor", unix)))
+    )]
+    pub fn io_reactor<F>(&mut self, factory: F) -> &mut Self
+    where
+        F: Fn(usize) -> io::Result<std::sync::Arc<dyn crate::runtime::reactor::Reactor>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.enable_io();
+        self.io_reactor = Some(std::sync::Arc::new(factory));
         self
     }
 
@@ -1204,6 +1245,17 @@ impl Builder {
             nevents: self.nevents,
             nevents_busy: self.nevents_busy,
             timer_flavor: self.timer_flavor,
+            #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+            reactor: self.io_reactor.clone().map(|factory| {
+                let workers = match self.kind {
+                    Kind::CurrentThread => 1,
+                    #[cfg(feature = "rt-multi-thread")]
+                    Kind::MultiThread => {
+                        self.worker_threads.unwrap_or_else(crate::loom::sys::num_cpus)
+                    }
+                };
+                (factory, workers)
+            }),
         }
     }
 
@@ -2264,6 +2316,9 @@ impl fmt::Debug for Builder {
                 "enable_eager_driver_handoff",
                 &self.enable_eager_driver_handoff,
             );
+
+        #[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+        debug.field("io_reactor", &self.io_reactor.as_ref().map(|_| "..."));
 
         if self.name.is_none() {
             debug.finish_non_exhaustive()

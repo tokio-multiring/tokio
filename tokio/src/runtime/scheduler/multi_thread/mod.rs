@@ -16,7 +16,10 @@ mod stats;
 pub(crate) use stats::Stats;
 
 mod park;
-pub(crate) use park::{Parker, Unparker};
+pub(crate) use park::{Parker, WorkerParker, WorkerUnparker};
+
+#[cfg(all(tokio_unstable, feature = "io-reactor", unix))]
+pub(crate) mod reactor_park;
 
 pub(crate) mod queue;
 
