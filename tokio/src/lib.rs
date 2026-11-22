@@ -358,6 +358,8 @@
 //! - `io-uring`: Enables `io-uring` (Linux only).
 //! - `io-reactor`: Enables plugging an external I/O reactor into the runtime (Unix only).
 //! - `taskdump`: Enables `taskdump` (Linux only).
+//! - `worker-local`: Enables spawning worker-affine (`!Send`) tasks on the
+//!   multi-threaded runtime.
 //!
 //! Likewise, this flag enables access to unstable APIs.
 //!

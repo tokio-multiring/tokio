@@ -9,6 +9,13 @@ pub(crate) struct Config {
     /// How many ticks before pulling a task from the global/remote queue?
     pub(crate) global_queue_interval: Option<u32>,
 
+    /// How many ticks before prioritizing the worker-local queue?
+    ///
+    /// When `None`, shares the worker's `global_queue_interval` (offset by
+    /// half an interval).
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(crate) worker_local_queue_interval: Option<std::num::NonZeroU32>,
+
     /// How many ticks before yielding to the driver for timer and I/O events?
     pub(crate) event_interval: u32,
 
@@ -31,6 +38,16 @@ pub(crate) struct Config {
     /// To run after each poll
     #[cfg(tokio_unstable)]
     pub(crate) after_poll: Option<TaskCallback>,
+
+    /// To run when a worker runs out of local work, before it attempts to
+    /// steal from other workers.
+    #[cfg(tokio_unstable)]
+    pub(crate) before_steal: Option<Callback>,
+
+    /// To run when a worker is about to attempt stealing tasks from other
+    /// workers' queues.
+    #[cfg(tokio_unstable)]
+    pub(crate) on_steal: Option<Callback>,
 
     /// The multi-threaded scheduler includes a per-worker LIFO slot used to
     /// store the last scheduled task. This can improve certain usage patterns,

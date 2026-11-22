@@ -304,6 +304,13 @@ cfg_rt! {
     mod local;
     pub use local::{spawn_local, LocalSet, LocalEnterGuard};
 
+    cfg_worker_local! {
+        pub(crate) mod spawn_worker_local;
+        pub use spawn_worker_local::{
+            run_on_any_worker, run_on_each_worker, run_on_worker, spawn_worker_local,
+        };
+    }
+
     mod task_local;
     pub use task_local::LocalKey;
 
